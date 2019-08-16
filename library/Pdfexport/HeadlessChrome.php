@@ -3,11 +3,21 @@
 
 namespace Icinga\Module\Pdfexport;
 
+use Exception;
 use Icinga\File\Storage\StorageInterface;
 use Icinga\File\Storage\TemporaryLocalFileStorage;
+use LogicException;
+use Ratchet\Client\WebSocket;
+use Ratchet\RFC6455\Messaging\Message;
+use React\ChildProcess\Process;
+use React\EventLoop\Factory;
+use React\EventLoop\LoopInterface;
+use function Ratchet\Client\connect;
 
 class HeadlessChrome
 {
+    const DEBUG_ADDR_PATTERN = '/^DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[\w-]+)$/';
+
     /** @var string Path to the Chrome binary */
     protected $binary;
 
@@ -171,26 +181,113 @@ class HeadlessChrome
 
         $path = $storage->resolvePath($path, true);
 
-        $arguments = [
-            '--headless',
-            '--disable-gpu',
-            '--no-sandbox',
-            '--print-to-pdf=' => $path,
-            $this->getUrl()
-        ];
+        $context = (object) [];
 
-        $command = new ShellCommand(
-            escapeshellarg($this->getBinary()) . ' ' . static::renderArgumentList($arguments),
-            false
-        );
+        $loop = Factory::create();
+        $context->loop = $loop;
 
-        $output = $command->execute();
+        $chrome = new Process(join(' ', [
+            escapeshellarg($this->getBinary()),
+            static::renderArgumentList([
+                '--headless',
+                '--disable-gpu',
+                '--no-sandbox',
+                '--remote-debugging-port=0'
+            ])
+        ]));
+        $context->chrome = $chrome;
 
-        if ($command->getExitCode() !== 0) {
-            throw new \Exception($output->stderr);
+        $chrome->start($loop);
+        $chrome->stderr->on('data', function ($chunk) use ($context) {
+            if (preg_match(self::DEBUG_ADDR_PATTERN, trim($chunk), $matches)) {
+                connect($matches[1], [], [], $context->loop)->then(function (WebSocket $ws) use ($context) {
+                    $context->ws = $ws;
+
+                    $ws->once('message', function (Message $msg) use ($context) {
+                        $result = $this->parseApiResponse($msg->getPayload());
+                        $context->targetId = $result['targetId'];
+
+                        $context->ws->once('message', function (Message $msg) use ($context) {
+                            $result = json_decode($msg->getPayload(), true);
+                            if (! isset($result['method']) || $result['method'] !== 'Target.attachedToTarget') {
+                                throw new LogicException(sprintf('Unexpected response: %s', $msg->getPayload()));
+                            } else {
+                                $context->attachedTarget = $result['params'];
+                            }
+
+                            $context->ws->once('message', function (Message $msg) use ($context) {
+                                $result = $this->parseApiResponse($msg->getPayload()); // Error handling
+                                $context->ws->once('message', function (Message $msg) use ($context) {
+                                    $result = $this->parseApiResponse($msg->getPayload());
+                                    $context->result = $result['data'];
+
+                                    $context->ws->close();
+                                    $context->chrome->terminate();
+                                });
+                                $context->ws->send($this->renderApiCall('Page.printToPDF', [
+                                    'transferMode'  => 'ReturnAsBase64'
+                                ], $result['sessionId']));
+                            });
+                        });
+                        $context->ws->send($this->renderApiCall('Target.attachToTarget', [
+                            'targetId'  => $context->targetId
+                        ]));
+                    });
+                    $ws->send($this->renderApiCall('Target.createTarget', [
+                        'url'   => $this->getUrl()
+                    ]));
+                });
+            }
+        });
+
+        $chrome->on('exit', function ($exitCode, $termSignal) {
+            if ($exitCode) {
+                throw new \Exception($exitCode);
+            }
+        });
+
+        try {
+            $loop->run();
+        } catch (Exception $e) {
+            $chrome->terminate();
+            throw $e;
         }
 
         return $path;
+    }
+
+    private function renderApiCall($method, $options = null, $sessionId = null)
+    {
+        $data = [
+            'id' => time(),
+            'method' => $method,
+            'params' => $options ?: []
+        ];
+        if ($sessionId !== null) {
+            $data['sessionId'] = $sessionId;
+        }
+
+        return json_encode($data);
+    }
+
+    private function parseApiResponse($payload)
+    {
+        $data = json_decode($payload, true);
+        if (! isset($data['id'])) {
+            throw new LogicException(sprintf('Response has no id: %s', $payload));
+        }
+
+        if (isset($data['result'])) {
+            return $data['result'];
+        } elseif (isset($data['error'])) {
+            throw new Exception(sprintf(
+                'Error response (%s): %s',
+                $data['error']['code'],
+                $data['error']['message']
+            ));
+        } else {
+            throw new Exception(sprintf('Unknown response received: %s', $payload));
+        }
     }
 
     /**
