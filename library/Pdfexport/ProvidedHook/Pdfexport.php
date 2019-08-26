@@ -113,7 +113,9 @@ CSS;
         $response->setHeader('Content-Disposition', "inline; filename=\"$filename\"", true);
         $response->sendHeaders();
 
-        readfile($pdf);
+        $pdf = file_get_contents($pdf);
+        $pdf = preg_replace('/4 0 obj\n.*\n.*\n.*\n.*\n.*\n.*\nendobj/', '', $pdf);
+        echo $pdf;
 
         exit;
     }
